@@ -1,0 +1,79 @@
+diff --git a/ThunkLibs/libwayland-client/Guest.cpp b/ThunkLibs/libwayland-client/Guest.cpp
+index 2f887a6a3..dcc2adea6 100644
+--- a/ThunkLibs/libwayland-client/Guest.cpp
++++ b/ThunkLibs/libwayland-client/Guest.cpp
+@@ -101,6 +101,7 @@ extern "C" int wl_proxy_add_listener(wl_proxy* proxy, void (**callback)(void), v
+   delete[] (uint64_t*)wl_proxy_get_listener(proxy); // Delete previous substitute, if any
+   auto host_callbacks = new uint64_t[WL_CLOSURE_MAX_ARGS];
+ 
++  const uint32_t proxy_version = wl_proxy_get_version(proxy);
+   for (int i = 0; i < fex_wl_get_interface_event_count(proxy); ++i) {
+     char event_signature[16];
+     fex_wl_get_interface_event_signature(proxy, i, event_signature);
+@@ -111,6 +112,17 @@ extern "C" int wl_proxy_add_listener(wl_proxy* proxy, void (**callback)(void), v
+     auto [ptr, res] = std::from_chars(signature2.begin(), signature2.end(), since_version, 10);
+     auto signature = std::string {signature2.substr(ptr - signature2.begin())};
+ 
++    // Events added in a protocol version newer than the one this proxy was bound at are never
++    // dispatched to it, and the application's listener (built against older protocol headers) may
++    // not even have a slot for them. The interface tables come from the host libwayland, which can
++    // be newer than the guest's (e.g. wl_pointer::warp, "ff", added in version 11), so skip such
++    // events rather than reading past the listener or aborting on their signatures. A proxy
++    // version of 0 means unversioned, which receives every event.
++    if (proxy_version != 0 && since_version > proxy_version) {
++      host_callbacks[i] = 0;
++      continue;
++    }
++
+     // ? just indicates that the argument may be null, so it doesn't change the signature
+     signature.erase(std::remove(signature.begin(), signature.end(), '?'), signature.end());
+ 
+@@ -122,6 +134,9 @@ extern "C" int wl_proxy_add_listener(wl_proxy* proxy, void (**callback)(void), v
+       host_callbacks[i] = WaylandAllocateHostTrampolineForGuestListener<'a'>(callback[i]);
+     } else if (signature == "f") {
+       host_callbacks[i] = WaylandAllocateHostTrampolineForGuestListener<'f'>(callback[i]);
++    } else if (signature == "ff") {
++      // E.g. wl_pointer_listener::warp
++      host_callbacks[i] = WaylandAllocateHostTrampolineForGuestListener<'f', 'f'>(callback[i]);
+     } else if (signature == "hu") {
+       // E.g. zwp_linux_dmabuf_feedback_v1::format_table
+       host_callbacks[i] = WaylandAllocateHostTrampolineForGuestListener<'h', 'u'>(callback[i]);
+diff --git a/ThunkLibs/libwayland-client/Host.cpp b/ThunkLibs/libwayland-client/Host.cpp
+index 68c2ded33..85c865200 100644
+--- a/ThunkLibs/libwayland-client/Host.cpp
++++ b/ThunkLibs/libwayland-client/Host.cpp
+@@ -316,6 +316,7 @@ fexfn_impl_libwayland_client_wl_proxy_add_listener(struct wl_proxy* proxy, guest
+   assert_is_valid_host_interface(interface);
+ 
+   auto callback_table = callback_table_raw.force_get_host_pointer();
++  const uint32_t proxy_version = fexldr_ptr_libwayland_client_wl_proxy_get_version(proxy);
+ 
+   for (int i = 0; i < interface->event_count; ++i) {
+     auto signature_view = std::string_view {interface->events[i].signature};
+@@ -328,6 +329,16 @@ fexfn_impl_libwayland_client_wl_proxy_add_listener(struct wl_proxy* proxy, guest
+     // ? just indicates that the argument may be null, so it doesn't change the signature
+     signature.erase(std::remove(signature.begin(), signature.end(), '?'), signature.end());
+ 
++    // Events added in a protocol version newer than the one this proxy was bound at are never
++    // dispatched to it, and the application's listener (built against older protocol headers) may
++    // not even have a slot for them. The interface tables come from the host libwayland, which can
++    // be newer than the guest's (e.g. wl_pointer::warp, "ff", added in version 11), so skip such
++    // events rather than reading past the listener or aborting on their signatures. A proxy
++    // version of 0 means unversioned, which receives every event.
++    if (proxy_version != 0 && since_version > proxy_version) {
++      continue;
++    }
++
+     auto callback = callback_table[i];
+ 
+     if (signature == "") {
+@@ -339,6 +350,9 @@ fexfn_impl_libwayland_client_wl_proxy_add_listener(struct wl_proxy* proxy, guest
+                                                        (void*)CallGuestPtrWithWaylandArray<void, void*, wl_proxy*>);
+     } else if (signature == "f") {
+       WaylandFinalizeHostTrampolineForGuestListener<'f'>(callback);
++    } else if (signature == "ff") {
++      // E.g. wl_pointer_listener::warp
++      WaylandFinalizeHostTrampolineForGuestListener<'f', 'f'>(callback);
+     } else if (signature == "hu") {
+       // E.g. zwp_linux_dmabuf_feedback_v1::format_table
+       WaylandFinalizeHostTrampolineForGuestListener<'h', 'u'>(callback);

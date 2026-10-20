@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Sat, 28 Mar 2026 18:03:18 +0000
+Subject: Enable multi-axis on Retro*CM5
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ drivers/hid/hid-input.c | 17 ++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/hid/hid-input.c b/drivers/hid/hid-input.c
+index 9475b7e9da43..b3a44709d37a 100644
+--- a/drivers/hid/hid-input.c
++++ b/drivers/hid/hid-input.c
+@@ -1441,12 +1441,17 @@ static void hidinput_configure_usage(struct hid_input *hidinput, struct hid_fiel
+ 
+ 		if (field->application == HID_GD_GAMEPAD || field->application == HID_GD_JOYSTICK)
+ 			input_set_abs_params(input, usage->code, a, b, (b - a) >> 8, (b - a) >> 4);
+ 		else	input_set_abs_params(input, usage->code, a, b, 0, 0);
+ 
+-		input_abs_set_res(input, usage->code,
+-				  hidinput_calc_abs_res(field, usage->code));
++		if (field->application == HID_GD_MULTIAXIS)
++			input_abs_set_res(input, usage->code,
++					DIV_ROUND_CLOSEST(field->logical_maximum - field->logical_minimum,
++						field->physical_maximum - field->physical_minimum));
++		else
++			input_abs_set_res(input, usage->code,
++					hidinput_calc_abs_res(field, usage->code));
+ 
+ 		/* use a larger default input buffer for MT devices */
+ 		if (usage->code == ABS_MT_POSITION_X && input->hint_events_per_packet == 0)
+ 			input_set_events_per_packet(input, 60);
+ 	}
+@@ -2073,10 +2078,18 @@ static struct hid_input *hidinput_allocate(struct hid_device *hid,
+ 			suffix = "Consumer Control";
+ 			break;
+ 		case HID_GD_WIRELESS_RADIO_CTLS:
+ 			suffix = "Wireless Radio Control";
+ 			break;
++		case HID_GD_MULTIAXIS:
++			if ((hid->vendor == 0x2341 && hid->product == 0x8037) || (hid->vendor == 0xcafe && hid->product == 0x5005)) {
++				// __set_bit(EV_MSC, input_dev->evbit);
++				// __set_bit(MSC_TIMESTAMP, input_dev->mscbit);
++				__set_bit(INPUT_PROP_ACCELEROMETER, input_dev->propbit);
++				suffix = "Motion Sensors";
++			}
++			break;
+ 		case HID_GD_SYSTEM_MULTIAXIS:
+ 			suffix = "System Multi Axis";
+ 			break;
+ 		default:
+ 			break;
+-- 
+Created with Armbian build tools https://github.com/armbian/build
+

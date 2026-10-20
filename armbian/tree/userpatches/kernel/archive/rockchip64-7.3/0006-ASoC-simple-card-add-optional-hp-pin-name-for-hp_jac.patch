@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Fri, 20 Mar 2026 21:38:05 +0000
+Subject: ASoC: simple-card: add optional "hp-pin-name" for hp_jack
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ sound/soc/generic/simple-card.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/generic/simple-card.c b/sound/soc/generic/simple-card.c
+index 06638f9a74b8..85097d4f6b4e 100644
+--- a/sound/soc/generic/simple-card.c
++++ b/sound/soc/generic/simple-card.c
+@@ -689,13 +689,18 @@ static int simple_get_dais_count(struct simple_util_priv *priv,
+ }
+ 
+ static int simple_soc_probe(struct snd_soc_card *card)
+ {
+ 	struct simple_util_priv *priv = snd_soc_card_get_drvdata(card);
++	char prop[128];
++	const char *hp_pin = NULL;
+ 	int ret;
+ 
+-	ret = simple_util_init_hp(card, &priv->hp_jack, PREFIX);
++	snprintf(prop, sizeof(prop), "%shp-pin-name", PREFIX);
++	of_property_read_string(card->dev->of_node, prop, &hp_pin);
++
++	ret = simple_util_init_jack(card, &priv->hp_jack, 1, PREFIX, (char *)hp_pin);
+ 	if (ret < 0)
+ 		goto end;
+ 
+ 	ret = simple_util_init_mic(card, &priv->mic_jack, PREFIX);
+ 	if (ret < 0)
+-- 
+Created with Armbian build tools https://github.com/armbian/build
+

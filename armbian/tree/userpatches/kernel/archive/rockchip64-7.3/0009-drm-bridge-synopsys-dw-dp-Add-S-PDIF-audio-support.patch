@@ -1,0 +1,356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivan Podogov <ginkage.uk@gmail.com>
+Date: Fri, 25 Sep 2026 23:01:17 +0100
+Subject: [PATCH] drm/bridge: synopsys: dw-dp: Add S/PDIF audio support
+
+The DW DP controller has an audio input that takes I2S or S/PDIF, but
+the driver never programs it, so no audio reaches DP sinks.
+
+Implement the DRM bridge DP audio callbacks, following the Rockchip BSP
+driver: configure the input in DW_DP_AUD_CONFIG1, enable the audio
+stream and timestamp SDPs, and send the Audio InfoFrame from the SDP
+bank that atomic_enable() already reserves. The controller is reset
+when the output is disabled, so the audio setup is re-applied on the
+next enable.
+
+Only S/PDIF is exposed, as the DAI is referenced without arguments
+(#sound-dai-cells = <0>). Hotplug events are forwarded to the HDMI
+codec so that it reports the jack state and picks up the ELD.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/bridge/synopsys/Kconfig
++++ b/drivers/gpu/drm/bridge/synopsys/Kconfig
+@@ -3,6 +3,7 @@
+ 	tristate
+ 	select DRM_DISPLAY_HELPER
+ 	select DRM_DISPLAY_DP_HELPER
++	select DRM_DISPLAY_HDMI_AUDIO_HELPER
+ 	select DRM_KMS_HELPER
+ 	select REGMAP_MMIO
+ 
+--- a/drivers/gpu/drm/bridge/synopsys/dw-dp.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-dp.c
+@@ -8,6 +8,7 @@
+  */
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/hdmi.h>
+ #include <linux/iopoll.h>
+ #include <linux/irq.h>
+ #include <linux/media-bus-format.h>
+@@ -23,12 +24,15 @@
+ #include <drm/drm_bridge.h>
+ #include <drm/drm_bridge_connector.h>
+ #include <drm/display/drm_dp_helper.h>
++#include <drm/display/drm_hdmi_audio_helper.h>
+ #include <drm/drm_edid.h>
+ #include <drm/drm_of.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
+ 
++#include <sound/hdmi-codec.h>
++
+ #define DW_DP_VERSION_NUMBER			0x0000
+ #define DW_DP_VERSION_TYPE			0x0004
+ #define DW_DP_ID				0x0008
+@@ -252,6 +256,8 @@
+ #define DW_DP_MAX_REGISTER			DW_DP_HDCP_REG_DPK_CRC
+ 
+ #define SDP_REG_BANK_SIZE			16
++/* SDP register bank reserved for the Audio InfoFrame */
++#define DW_DP_AUDIO_SDP_BANK			0
+ 
+ struct dw_dp_link_caps {
+ 	bool enhanced_framing;
+@@ -330,6 +336,14 @@
+ 	u8 pixel_mode;
+ 
+ 	DECLARE_BITMAP(sdp_reg_bank, SDP_REG_BANK_SIZE);
++
++	/* Serialize audio setup against output enable/disable */
++	struct mutex audio_lock;
++	struct clk *audio_clk;
++	u32 audio_cfg;
++	u8 audio_channels;
++	bool audio_mute;
++	bool enabled;
+ };
+ 
+ enum {
+@@ -1036,19 +1050,11 @@
+ 	return 0;
+ }
+ 
+-static int dw_dp_send_sdp(struct dw_dp *dp, struct dw_dp_sdp *sdp)
++static void dw_dp_write_sdp(struct dw_dp *dp, struct dw_dp_sdp *sdp, int nr)
+ {
+ 	const u8 *payload = sdp->base.db;
+-	u32 reg;
+-	int i, nr;
+-
+-	nr = find_first_zero_bit(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
+-	if (nr < SDP_REG_BANK_SIZE)
+-		set_bit(nr, dp->sdp_reg_bank);
+-	else
+-		return -EBUSY;
+-
+-	reg = DW_DP_SDP_REGISTER_BANK + nr * 9 * 4;
++	u32 reg = DW_DP_SDP_REGISTER_BANK + nr * 9 * 4;
++	int i;
+ 
+ 	/* SDP header */
+ 	regmap_write(dp->regmap, reg, get_unaligned_le32(&sdp->base.sdp_header));
+@@ -1067,6 +1073,19 @@
+ 		regmap_update_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
+ 				   EN_HORIZONTAL_SDP << nr,
+ 				   EN_HORIZONTAL_SDP << nr);
++}
++
++static int dw_dp_send_sdp(struct dw_dp *dp, struct dw_dp_sdp *sdp)
++{
++	int nr;
++
++	nr = find_first_zero_bit(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
++	if (nr < SDP_REG_BANK_SIZE)
++		set_bit(nr, dp->sdp_reg_bank);
++	else
++		return -EBUSY;
++
++	dw_dp_write_sdp(dp, sdp, nr);
+ 
+ 	return 0;
+ }
+@@ -1643,6 +1662,52 @@
+ 	return ret;
+ }
+ 
++static void dw_dp_audio_apply(struct dw_dp *dp)
++{
++	struct dw_dp_sdp sdp = { .flags = DW_DP_SDP_VERTICAL_INTERVAL };
++	struct hdmi_audio_infoframe frame;
++	struct clk *other;
++	int ret;
++
++	/* Both interface clocks must run while the input is switched */
++	other = dp->audio_clk == dp->i2s_clk ? dp->spdif_clk : dp->i2s_clk;
++	ret = clk_prepare_enable(other);
++
++	regmap_update_bits(dp->regmap, DW_DP_AUD_CONFIG1,
++			   AUDIO_MUTE | NUM_CHANNELS | AUDIO_DATA_WIDTH |
++			   AUDIO_DATA_IN_EN | AUDIO_INF_SELECT,
++			   dp->audio_cfg | FIELD_PREP(AUDIO_MUTE, dp->audio_mute));
++	usleep_range(20, 40);
++
++	if (!ret)
++		clk_disable_unprepare(other);
++
++	regmap_update_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
++			   EN_AUDIO_STREAM_SDP | EN_AUDIO_TIMESTAMP_SDP,
++			   EN_AUDIO_STREAM_SDP | EN_AUDIO_TIMESTAMP_SDP);
++	regmap_update_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
++			   EN_AUDIO_STREAM_SDP, EN_AUDIO_STREAM_SDP);
++
++	hdmi_audio_infoframe_init(&frame);
++	frame.channels = dp->audio_channels;
++	frame.coding_type = HDMI_AUDIO_CODING_TYPE_STREAM;
++	frame.sample_frequency = HDMI_AUDIO_SAMPLE_FREQUENCY_STREAM;
++	frame.sample_size = HDMI_AUDIO_SAMPLE_SIZE_STREAM;
++
++	if (hdmi_audio_infoframe_pack_for_dp(&frame, &sdp.base, 0x12) > 0)
++		dw_dp_write_sdp(dp, &sdp, DW_DP_AUDIO_SDP_BANK);
++}
++
++static void dw_dp_audio_stop(struct dw_dp *dp)
++{
++	regmap_update_bits(dp->regmap, DW_DP_AUD_CONFIG1, AUDIO_DATA_IN_EN, 0);
++	regmap_update_bits(dp->regmap, DW_DP_SDP_VERTICAL_CTRL,
++			   EN_AUDIO_STREAM_SDP | EN_AUDIO_TIMESTAMP_SDP |
++			   EN_VERTICAL_SDP << DW_DP_AUDIO_SDP_BANK, 0);
++	regmap_update_bits(dp->regmap, DW_DP_SDP_HORIZONTAL_CTRL,
++			   EN_AUDIO_STREAM_SDP, 0);
++}
++
+ static void dw_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+ 				       struct drm_atomic_commit *state)
+ {
+@@ -1663,7 +1728,7 @@
+ 		return;
+ 	}
+ 
+-	set_bit(0, dp->sdp_reg_bank);
++	set_bit(DW_DP_AUDIO_SDP_BANK, dp->sdp_reg_bank);
+ 
+ 	ret = dw_dp_link_enable(dp);
+ 	if (ret < 0) {
+@@ -1676,6 +1741,12 @@
+ 		dev_err(dp->dev, "failed to enable video: %d\n", ret);
+ 		return;
+ 	}
++
++	mutex_lock(&dp->audio_lock);
++	dp->enabled = true;
++	if (dp->audio_cfg)
++		dw_dp_audio_apply(dp);
++	mutex_unlock(&dp->audio_lock);
+ }
+ 
+ static void dw_dp_reset(struct dw_dp *dp)
+@@ -1701,6 +1772,10 @@
+ {
+ 	struct dw_dp *dp = bridge_to_dp(bridge);
+ 
++	mutex_lock(&dp->audio_lock);
++	dp->enabled = false;
++	mutex_unlock(&dp->audio_lock);
++
+ 	dw_dp_video_disable(dp);
+ 	dw_dp_link_disable(dp);
+ 	bitmap_zero(dp->sdp_reg_bank, SDP_REG_BANK_SIZE);
+@@ -1813,6 +1888,108 @@
+ 	return &state->base;
+ }
+ 
++static void dw_dp_bridge_hpd_notify(struct drm_bridge *bridge,
++				    struct drm_connector *connector,
++				    enum drm_connector_status status)
++{
++	if (bridge->ops & DRM_BRIDGE_OP_DP_AUDIO)
++		drm_connector_hdmi_audio_plugged_notify(connector,
++							status == connector_status_connected);
++}
++
++static int dw_dp_audio_prepare(struct drm_bridge *bridge,
++			       struct drm_connector *connector,
++			       struct hdmi_codec_daifmt *daifmt,
++			       struct hdmi_codec_params *params)
++{
++	struct dw_dp *dp = bridge_to_dp(bridge);
++	unsigned int width;
++	struct clk *clk;
++	u32 inf_select;
++	int ret = 0;
++
++	switch (daifmt->fmt) {
++	case HDMI_I2S:
++		clk = dp->i2s_clk;
++		inf_select = 0;
++		break;
++	case HDMI_SPDIF:
++		clk = dp->spdif_clk;
++		inf_select = 1;
++		break;
++	default:
++		dev_err(dp->dev, "unsupported audio format %d\n", daifmt->fmt);
++		return -EINVAL;
++	}
++
++	if (params->channels < 1 || params->channels > 8)
++		return -EINVAL;
++
++	/* DP audio samples are at most 24 bits wide */
++	width = min(params->sample_width, 24);
++
++	mutex_lock(&dp->audio_lock);
++
++	if (clk != dp->audio_clk) {
++		ret = clk_prepare_enable(clk);
++		if (ret)
++			goto out;
++
++		clk_disable_unprepare(dp->audio_clk);
++		dp->audio_clk = clk;
++	}
++
++	dp->audio_channels = params->channels;
++	dp->audio_cfg = FIELD_PREP(AUDIO_DATA_IN_EN,
++				   BIT(DIV_ROUND_UP(params->channels, 2)) - 1) |
++			FIELD_PREP(NUM_CHANNELS, params->channels - 1) |
++			FIELD_PREP(AUDIO_DATA_WIDTH, width) |
++			FIELD_PREP(AUDIO_INF_SELECT, inf_select);
++
++	if (dp->enabled)
++		dw_dp_audio_apply(dp);
++
++out:
++	mutex_unlock(&dp->audio_lock);
++
++	return ret;
++}
++
++static void dw_dp_audio_shutdown(struct drm_bridge *bridge,
++				 struct drm_connector *connector)
++{
++	struct dw_dp *dp = bridge_to_dp(bridge);
++
++	mutex_lock(&dp->audio_lock);
++
++	if (dp->enabled)
++		dw_dp_audio_stop(dp);
++
++	dp->audio_cfg = 0;
++	clk_disable_unprepare(dp->audio_clk);
++	dp->audio_clk = NULL;
++
++	mutex_unlock(&dp->audio_lock);
++}
++
++static int dw_dp_audio_mute_stream(struct drm_bridge *bridge,
++				   struct drm_connector *connector,
++				   bool enable, int direction)
++{
++	struct dw_dp *dp = bridge_to_dp(bridge);
++
++	mutex_lock(&dp->audio_lock);
++
++	dp->audio_mute = enable;
++	if (dp->enabled)
++		regmap_update_bits(dp->regmap, DW_DP_AUD_CONFIG1, AUDIO_MUTE,
++				   FIELD_PREP(AUDIO_MUTE, enable));
++
++	mutex_unlock(&dp->audio_lock);
++
++	return 0;
++}
++
+ static const struct drm_bridge_funcs dw_dp_bridge_funcs = {
+ 	.atomic_duplicate_state = dw_dp_bridge_atomic_duplicate_state,
+ 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
+@@ -1825,6 +2002,10 @@
+ 	.atomic_disable = dw_dp_bridge_atomic_disable,
+ 	.detect = dw_dp_bridge_detect,
+ 	.edid_read = dw_dp_bridge_edid_read,
++	.hpd_notify = dw_dp_bridge_hpd_notify,
++	.dp_audio_prepare = dw_dp_audio_prepare,
++	.dp_audio_shutdown = dw_dp_audio_shutdown,
++	.dp_audio_mute_stream = dw_dp_audio_mute_stream,
+ };
+ 
+ static int dw_dp_link_retrain(struct dw_dp *dp)
+@@ -1980,6 +2161,7 @@
+ 	dp->plat_data.max_link_rate = plat_data->max_link_rate;
+ 	bridge = &dp->bridge;
+ 	mutex_init(&dp->irq_lock);
++	mutex_init(&dp->audio_lock);
+ 	INIT_WORK(&dp->hpd_work, dw_dp_hpd_work);
+ 	init_completion(&dp->complete);
+ 
+@@ -2040,6 +2222,17 @@
+ 	bridge->type = DRM_MODE_CONNECTOR_DisplayPort;
+ 	bridge->ycbcr_420_allowed = true;
+ 
++	/*
++	 * Only S/PDIF is exposed: the DAI is referenced without arguments
++	 * (#sound-dai-cells = <0>), so a single interface can be addressed.
++	 */
++	if (dp->spdif_clk) {
++		bridge->ops |= DRM_BRIDGE_OP_DP_AUDIO;
++		bridge->hdmi_audio_dev = dev;
++		bridge->hdmi_audio_spdif_playback = 1;
++		bridge->hdmi_audio_dai_port = -1;
++	}
++
+ 	ret = devm_drm_bridge_add(dev, bridge);
+ 	if (ret)
+ 		return ERR_PTR(ret);

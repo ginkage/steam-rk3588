@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Sat, 21 Mar 2026 14:47:35 +0000
+Subject: ASoC: hdmi-codec: skip startup when monitor is unplugged
+
+When a driver supports HDMI plug detection (hook_plugged_cb) and no
+monitor is connected, hdmi_codec_startup() tries to read an all-zero
+ELD buffer and logs "HDMI: Unknown ELD version 0" via snd_parse_eld(),
+then hw_params and prepare proceed and ultimately fail with -ENODEV
+from the platform driver (e.g. dw-hdmi-qp when tmds_char_rate == 0),
+producing repeated "ASoC error (-19): at snd_soc_dai_prepare()" spam.
+
+Return -EOPNOTSUPP early when the connector is known to be unplugged.
+snd_soc_ret() silences -EOPNOTSUPP, so no error is logged, and the
+audio daemon sees a clean "not supported" response rather than a device
+error that triggers aggressive retries.
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ sound/soc/codecs/hdmi-codec.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/sound/soc/codecs/hdmi-codec.c b/sound/soc/codecs/hdmi-codec.c
+index 13ae9e83bc21..a19dce54955e 100644
+--- a/sound/soc/codecs/hdmi-codec.c
++++ b/sound/soc/codecs/hdmi-codec.c
+@@ -457,10 +457,15 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
+ 		dev_err(dai->dev, "Only one simultaneous stream supported!\n");
+ 		mutex_unlock(&hcp->lock);
+ 		return -EINVAL;
+ 	}
+ 
++	if (hcp->hcd.ops->hook_plugged_cb && !hcp->jack_status) {
++		mutex_unlock(&hcp->lock);
++		return -EOPNOTSUPP;
++	}
++
+ 	if (hcp->hcd.ops->audio_startup) {
+ 		ret = hcp->hcd.ops->audio_startup(dai->dev->parent, hcp->hcd.data);
+ 		if (ret)
+ 			goto err;
+ 	}
+-- 
+Created with Armbian build tools https://github.com/armbian/build
+

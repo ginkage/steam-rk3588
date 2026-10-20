@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Doe <john.doe@somewhere.on.planet>
+Date: Fri, 28 Mar 2026 12:00:00 +0000
+Subject: clk: rockchip: rk3588: allow DCLK_VOP3 to retune parent PLL
+
+DCLK_VOP3 is defined with flags=0, which means clk_set_rate() cannot
+propagate to the parent PLL. The vendor kernel works around this with
+a custom clock management layer that explicitly reparents dclk_vop3 to
+v0pll and retunes v0pll directly (commit 842ad2732d2a). Mainline has
+no such custom layer.
+
+Add CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT to match DCLK_VOP2,
+so the clock framework can propagate rate requests to the parent PLL.
+Board DTS must use assigned-clock-parents to set v0pll as the parent,
+since CLK_SET_RATE_NO_REPARENT prevents automatic reparenting.
+
+Also add a PLL rate table entry for 268555184 Hz (fractional mode:
+p=1, m=179, s=4, k=2411) so v0pll can produce exact MIPI DSI pixel
+clocks. Without this entry, the PLL can only be set to the pre-defined
+rates in the table, and the closest match produces ~134.1 MHz instead
+of the required ~134.3 MHz for 59.94 Hz refresh.
+
+The KLD35176C 640x480 panel on the Radxa CM5 IO board needs a 24.839 MHz
+pixel clock to run at 59.94 Hz refresh (HTOTAL=800, VTOTAL=518). With
+DCLK_VOP3 sourced from PLL_V0PLL through the 7-bit divider, the cleanest
+divisor that keeps the PLL inside its operating range is 80, which
+implies a PLL rate of 1,987,120,000 Hz. There is no entry in the
+existing rk3588_pll_rates[] table at or near this rate, so
+clk_set_rate() falls back to the nearest tabulated entry and the SoC
+delivers a different DCLK_VOP3 frequency than the bridge IPI math
+expects — producing IPI FIFO stall on the dw-mipi-dsi2 path and a
+blank panel.
+
+Add a fractional-mode PLL entry (p=1, m=82, s=0, k=52209) declared at
+1987120000 Hz. The actual delivered PLL rate from these registers is
+~1,987,119,798 Hz (about 200 Hz under the declared value, due to
+fractional PLL granularity of ~366 Hz/k-step), which keeps DCLK_VOP3
+at div=80 = 24,838,998 Hz — within 3 Hz of the declared pixel clock.
+
+Two subtleties matter here:
+
+1. The entry must be inserted in descending sort order between the
+   existing 1992000000 and 1968000000 entries: rockchip_pll_round_rate
+   iterates the table linearly and returns the first entry whose rate
+   is ≤ the requested drate, assuming descending sort. Out-of-order
+   entries are silently skipped by the iteration and never selected.
+
+2. The actual hardware-delivered rate must be ≤ the declared rate.
+   `divider_get_val` in the CCF divider uses
+   `ceil(actual_parent_rate / target_rate)` to pick the divisor, and
+   even 1 Hz of overshoot at the parent forces it to the next-higher
+   divisor (div 80 → 81 in our case), producing a much larger
+   undershoot at the output. Picking k=52209 instead of k=52210 puts
+   the actual PLL rate just under the declared value, keeping div=80.
+
+Signed-off-by: John Doe <john.doe@somewhere.on.planet>
+---
+ drivers/clk/rockchip/clk-rk3588.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/clk/rockchip/clk-rk3588.c b/drivers/clk/rockchip/clk-rk3588.c
+index 4bfc7d33e788..9a12ba06a8b1 100644
+--- a/drivers/clk/rockchip/clk-rk3588.c
++++ b/drivers/clk/rockchip/clk-rk3588.c
+@@ -49,5 +49,6 @@ static struct rockchip_pll_rate_table rk3588_pll_rates[] = {
+ 	RK3588_PLL_RATE(2016000000, 2, 336, 1, 0),
+ 	RK3588_PLL_RATE(1992000000, 2, 332, 1, 0),
++	RK3588_PLL_RATE(1987120000, 1, 82, 0, 52209),
+ 	RK3588_PLL_RATE(1968000000, 2, 328, 1, 0),
+ 	RK3588_PLL_RATE(1944000000, 2, 324, 1, 0),
+ 	RK3588_PLL_RATE(1920000000, 2, 320, 1, 0),
+@@ -92,5 +92,6 @@ static struct rockchip_pll_rate_table rk3588_pll_rates[] = {
+ 	RK3588_PLL_RATE(312000000, 2, 208, 3, 0),
++	RK3588_PLL_RATE(268555184, 1, 179, 4, 2411),
+ 	RK3588_PLL_RATE(216000000, 2, 288, 4, 0),
+ 	RK3588_PLL_RATE(100000000, 3, 400, 5, 0),
+ 	RK3588_PLL_RATE(96000000, 2, 256, 5, 0),
+ 	{ /* sentinel */ },
+@@ -2112,7 +2113,7 @@ static struct rockchip_clk_branch rk3588_clk_branches[] __initdata = {
+ 			CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
+ 			RK3588_CLKSEL_CON(112), 11, 2, MFLAGS,
+ 			RK3588_CLKGATE_CON(53), 1, GFLAGS),
+-	COMPOSITE(DCLK_VOP3, "dclk_vop3", gpll_cpll_v0pll_aupll_p, 0,
++	COMPOSITE(DCLK_VOP3, "dclk_vop3", gpll_cpll_v0pll_aupll_p, CLK_SET_RATE_PARENT | CLK_SET_RATE_NO_REPARENT,
+ 			RK3588_CLKSEL_CON(113), 7, 2, MFLAGS, 0, 7, DFLAGS,
+ 			RK3588_CLKGATE_CON(53), 2, GFLAGS),
+ 	GATE(PCLK_DSIHOST0, "pclk_dsihost0", "pclk_vop_root", 0,
+--
+Created with Armbian build tools https://github.com/armbian/build
+

@@ -1,0 +1,30 @@
+From: Ivan Podogov <ginkage.uk@gmail.com>
+Subject: [PATCH] drm/rockchip: dw_hdmi_qp: make max bpc configurable
+
+Add rockchipdrm.hdmi_max_bpc=8 to cap HDMI deep colour at 8 bpc for
+sinks that advertise 30-bit but fail at the higher TMDS rate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_hdmi_qp-rockchip.c
+@@ -88,6 +88,10 @@
+ #define HOTPLUG_DEBOUNCE_MS		150
+ #define MAX_HDMI_PORT_NUM		2
+ 
++static unsigned int hdmi_max_bpc = 10;
++module_param(hdmi_max_bpc, uint, 0444);
++MODULE_PARM_DESC(hdmi_max_bpc, "Maximum HDMI output bits per component: 8 or 10 (default: 10)");
++
+ struct rockchip_hdmi_qp {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+@@ -511,7 +515,7 @@
+ 
+ 	plat_data.phy_ops = cfg->phy_ops;
+ 	plat_data.phy_data = hdmi;
+-	plat_data.max_bpc = 10;
++	plat_data.max_bpc = hdmi_max_bpc == 8 ? 8 : 10;
+ 
+ 	encoder = &hdmi->encoder.encoder;
+ 	encoder->possible_crtcs = drm_of_find_possible_crtcs(drm, dev->of_node);

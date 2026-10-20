@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivan Podogov <ginkage.uk@gmail.com>
+Date: Fri, 25 Sep 2026 23:01:17 +0100
+Subject: [PATCH] arm64: dts: rockchip: Enable DP0 output and audio on rock-5a
+
+The second micro-HDMI port of the ROCK 5A is driven by DP0 (USBDP PHY0
+lanes 2/3) through a DP-to-HDMI converter, whose HPD output goes to
+GPIO0_C4 (DP0_HPDIN_M1). Describe that path: DP0 on VP2, a transparent
+bridge and a type D HDMI connector. The converter needs no control, so
+the RA620 compatible is used, as on the ROCK 5 ITX.
+
+Also add a sound card feeding DP0 from SPDIF_TX2, like the vendor
+kernel does, with MCLK at 512 * fs as in the vendor card; otherwise it
+stays at the boot-time AUPLL / 2. The dp0-sound node name matches the
+udev rule that rock-5a.conf installs to label the card.
+
+S/PDIF needs one clock workaround. The CRU requests AUPLL at 786432000,
+the PLL's determine_rate() returns that nominal rate while recalc gives
+786431991, so the framework sends PRE_RATE_CHANGE but never
+POST_RATE_CHANGE. The fractional divider notifier therefore leaves
+clk_spdif2_dp0 on the gated fractional divider, while the framework
+still believes it is on clk_spdif2_dp0_src. Re-parent it explicitly via
+assigned-clock-parents so both agree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/arm64/boot/dts/rockchip/rk3588s-rock-5a.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3588s-rock-5a.dts
+@@ -32,10 +32,49 @@
+ 		dais = <&i2s0_8ch_p0>;
+ 	};
+ 
++	bridge {
++		compatible = "radxa,ra620";
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++
++				hdmi1_bridge_in: endpoint {
++					remote-endpoint = <&dp0_out_con>;
++				};
++			};
++
++			port@1 {
++				reg = <1>;
++
++				hdmi1_bridge_out: endpoint {
++					remote-endpoint = <&hdmi1_con_in>;
++				};
++			};
++		};
++	};
++
+ 	chosen {
+ 		stdout-path = "serial2:1500000n8";
+ 	};
+ 
++	dp0-sound {
++		compatible = "simple-audio-card";
++		simple-audio-card,mclk-fs = <512>;
++		simple-audio-card,name = "DP0";
++
++		simple-audio-card,codec {
++			sound-dai = <&dp0>;
++		};
++
++		simple-audio-card,cpu {
++			sound-dai = <&spdif_tx2>;
++		};
++	};
++
+ 	hdmi0-con {
+ 		compatible = "hdmi-connector";
+ 		type = "d";
+@@ -47,6 +86,17 @@
+ 		};
+ 	};
+ 
++	hdmi1-con {
++		compatible = "hdmi-connector";
++		type = "d";
++
++		port {
++			hdmi1_con_in: endpoint {
++				remote-endpoint = <&hdmi1_bridge_out>;
++			};
++		};
++	};
++
+ 	leds {
+ 		compatible = "gpio-leds";
+ 		pinctrl-names = "default";
+@@ -185,6 +235,24 @@
+ 	cpu-supply = <&vdd_cpu_lit_s0>;
+ };
+ 
++&dp0 {
++	pinctrl-0 = <&dp0m1_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++&dp0_in {
++	dp0_in_vp2: endpoint {
++		remote-endpoint = <&vp2_out_dp0>;
++	};
++};
++
++&dp0_out {
++	dp0_out_con: endpoint {
++		remote-endpoint = <&hdmi1_bridge_in>;
++	};
++};
++
+ &gpu {
+ 	mali-supply = <&vdd_gpu_s0>;
+ 	status = "okay";
+@@ -473,6 +541,18 @@
+ 	};
+ };
+ 
++&spdif_tx2 {
++	/*
++	 * The AUPLL rate request at boot leaves clk_spdif2_dp0 switched to the
++	 * gated fractional divider behind the clock framework's back, so the
++	 * S/PDIF block gets no MCLK. Re-parent it here so hardware and
++	 * framework agree before the first stream.
++	 */
++	assigned-clocks = <&cru CLK_SPDIF2_DP0_SRC>, <&cru CLK_SPDIF2_DP0>;
++	assigned-clock-parents = <&cru PLL_AUPLL>, <&cru CLK_SPDIF2_DP0_FRAC>;
++	status = "okay";
++};
++
+ &spi2 {
+ 	status = "okay";
+ 	assigned-clocks = <&cru CLK_SPI2>;
+@@ -875,3 +955,10 @@
+ 		remote-endpoint = <&hdmi0_in_vp0>;
+ 	};
+ };
++
++&vp2 {
++	vp2_out_dp0: endpoint@a {
++		reg = <ROCKCHIP_VOP2_EP_DP0>;
++		remote-endpoint = <&dp0_in_vp2>;
++	};
++};

@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ivan Podogov <ginkage.uk@gmail.com>
+Date: Sun, 18 Oct 2026 16:00:00 +0100
+Subject: [PATCH] power: supply: max17042_battery: RetrOLED CM5 fuel gauge
+ changes
+
+Four changes to the fuel gauge driver for the RetrOLED CM5.
+
+Program MAX17055 VEmpty from battery info. EZ Config is programmed from
+DesignCap, IChgTerm, VEmpty and the charge voltage. The driver takes
+all of them from monitored-battery except VEmpty, so the gauge keeps
+detecting empty at the 3.3 V POR default whatever the battery's
+discharge cutoff is. Take the VE field (10 mV/LSB) from
+voltage-min-design-microvolt, the drained-battery voltage, and keep VR
+at the 3.88 V POR default that the datasheet recommends. Write it
+through the verified MAX17055 path along with the other EZ Config
+registers, and stop the generic POR override from writing VEmpty on
+the MAX17055, as was done for DesignCap and IChgTerm.
+VOLTAGE_MIN_DESIGN already reports the VE field, so it now reads back
+the battery's value.
+
+Rerun EZ Config when the battery parameters change. The gauge is only
+initialized after a power-on reset, so a DTS or overlay with different
+battery values only took effect once the battery had been disconnected.
+At probe, also reinitialize when DesignCap, IChgTerm, VEmpty or
+ModelCfg.VChg no longer match the battery description. The gauge never
+updates these registers itself, so this fires once per change. dQAcc
+and dPAcc are left out because the gauge updates them as it learns.
+
+Store maxim,over-volt in vmax. DT parsing assigns it to vmin, so the
+over-voltage threshold replaces the dead-battery one, vmax stays 0 and
+the health property always reports Dead. This is upstream commit
+f444a42dce5c ("power: supply: max17042_battery: Fix vmin assigned
+instead of vmax in DT parsing"), merged after v7.3-rc7; drop this hunk
+once the kernel base has it.
+
+Register the power supply as "battery" instead of "max170xx_battery",
+for ROCKNIX, which expects /sys/class/power_supply/battery.
+---
+ drivers/power/supply/max17042_battery.c | 72 ++++++++++++++++++++++---
+ 1 file changed, 66 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/power/supply/max17042_battery.c b/drivers/power/supply/max17042_battery.c
+index cbf3ac9c3e14..13d63a1c433c 100644
+--- a/drivers/power/supply/max17042_battery.c
++++ b/drivers/power/supply/max17042_battery.c
+@@ -67,6 +67,10 @@
+ #define MAX17055_DPACC_VCHG_FACTOR	51200
+ #define MAX17055_FSTAT_DNR_BIT		BIT(0)
+ #define MAX17055_VCHG_THRESHOLD_UV	4275000
++#define MAX17055_VEMPTY_VE_SHIFT	7
++#define MAX17055_VEMPTY_VE_LSB_UV	10000
++#define MAX17055_VEMPTY_VE_MAX		0x1ff
++#define MAX17055_VEMPTY_VR_DEFAULT	0x61 /* 3.88 V, 40 mV/LSB */
+ #define MAX17055_DNR_POLL_US		10000
+ #define MAX17055_DNR_TIMEOUT_US		2000000
+ #define MAX17055_INIT_RETRY_DELAY_MS	10000
+@@ -876,7 +880,6 @@ static inline void max17042_override_por_values(struct max17042_chip *chip)
+ 
+ 	if ((chip->chip_type == MAXIM_DEVICE_TYPE_MAX17047) ||
+ 	    (chip->chip_type == MAXIM_DEVICE_TYPE_MAX17050) ||
+-	    (chip->chip_type == MAXIM_DEVICE_TYPE_MAX17055) ||
+ 	    (chip->chip_type == MAXIM_DEVICE_TYPE_MAX77759)) {
+ 		max17042_override_por(map, MAX17047_V_empty, config->vempty);
+ 	}
+@@ -917,6 +920,13 @@ static int max17055_override_battery_values(struct max17042_chip *chip)
+ 			return ret;
+ 	}
+ 
++	if (config->vempty) {
++		ret = max17055_write_verify_reg(map, MAX17047_V_empty,
++						config->vempty);
++		if (ret)
++			return ret;
++	}
++
+ 	if (chip->enable_vchg_override) {
+ 		ret = regmap_update_bits(map, MAX17055_ModelCfg,
+ 					 MAX17055_MODELCFG_VCHG_BIT,
+@@ -1043,6 +1053,41 @@ restore_hibernate:
+ 	return ret;
+ }
+ 
++/*
++ * EZ Config normally runs only after a power-on reset. Also rerun it when
++ * the stable registers it programs differ from the battery description, so
++ * new battery parameters take effect without disconnecting the battery.
++ */
++static bool max17055_config_changed(struct max17042_chip *chip)
++{
++	struct max17042_config_data *config = chip->config_data;
++	struct regmap *map = chip->regmap;
++	unsigned int design_cap;
++	unsigned int ichgt_term;
++	unsigned int vempty;
++	unsigned int model_cfg;
++	bool changed;
++
++	if (chip->chip_type != MAXIM_DEVICE_TYPE_MAX17055 || !config)
++		return false;
++
++	if (regmap_read(map, MAX17042_DesignCap, &design_cap) ||
++	    regmap_read(map, MAX17042_ICHGTerm, &ichgt_term) ||
++	    regmap_read(map, MAX17047_V_empty, &vempty) ||
++	    regmap_read(map, MAX17055_ModelCfg, &model_cfg))
++		return false;
++
++	changed = (config->design_cap && design_cap != config->design_cap) ||
++		  (config->ichgt_term && ichgt_term != config->ichgt_term) ||
++		  (config->vempty && vempty != config->vempty) ||
++		  (chip->enable_vchg_override &&
++		   ((model_cfg ^ config->model_cfg) & MAX17055_MODELCFG_VCHG_BIT));
++	if (changed)
++		dev_info(chip->dev, "battery parameters changed, reinitializing\n");
++
++	return changed;
++}
++
+ static int max17042_init_chip(struct max17042_chip *chip)
+ {
+ 	struct regmap *map = chip->regmap;
+@@ -1233,7 +1278,7 @@ static int max17042_parse_dt(struct max17042_chip *chip)
+ 	if (of_property_read_u32(np, "maxim,over-volt", &prop))
+ 		chip->vmax = INT_MAX;
+ 	else
+-		chip->vmin = prop;
++		chip->vmax = prop;
+ 
+ 	return 0;
+ }
+@@ -1272,10 +1317,12 @@ static int max17042_apply_battery_properties(struct max17042_chip *chip,
+ 	bool have_design_cap;
+ 	bool have_ichgt_term;
+ 	bool have_vchg;
++	bool have_vempty;
+ 	u16 design_cap = 0;
+ 	u16 ichgt_term = 0;
+ 	u16 dqacc = 0;
+ 	u16 model_cfg = 0;
++	u16 vempty = 0;
+ 	u64 data64;
+ 
+ 	if (!info || chip->chip_type != MAXIM_DEVICE_TYPE_MAX17055)
+@@ -1286,7 +1333,8 @@ static int max17042_apply_battery_properties(struct max17042_chip *chip,
+ 	have_ichgt_term = chip->enable_current_sense &&
+ 		info->charge_term_current_ua > 0;
+ 	have_vchg = info->voltage_max_design_uv >= 0;
+-	if (!have_design_cap && !have_ichgt_term && !have_vchg)
++	have_vempty = info->voltage_min_design_uv > 0;
++	if (!have_design_cap && !have_ichgt_term && !have_vchg && !have_vempty)
+ 		return 0;
+ 
+ 	if (have_design_cap) {
+@@ -1328,6 +1376,16 @@ static int max17042_apply_battery_properties(struct max17042_chip *chip,
+ 			model_cfg = MAX17055_MODELCFG_VCHG_BIT;
+ 	}
+ 
++	if (have_vempty) {
++		data64 = info->voltage_min_design_uv / MAX17055_VEMPTY_VE_LSB_UV;
++		if (!data64 || data64 > MAX17055_VEMPTY_VE_MAX)
++			return dev_err_probe(dev, -ERANGE,
++					     "battery minimum design voltage is out of register range\n");
++
++		vempty = (u16)(data64 << MAX17055_VEMPTY_VE_SHIFT) |
++			 MAX17055_VEMPTY_VR_DEFAULT;
++	}
++
+ 	config = chip->config_data;
+ 	if (!config) {
+ 		config = devm_kzalloc(dev, sizeof(*config), GFP_KERNEL);
+@@ -1341,6 +1399,8 @@ static int max17042_apply_battery_properties(struct max17042_chip *chip,
+ 	}
+ 	if (have_ichgt_term)
+ 		config->ichgt_term = ichgt_term;
++	if (have_vempty)
++		config->vempty = vempty;
+ 	if (have_vchg) {
+ 		config->model_cfg &= ~MAX17055_MODELCFG_VCHG_BIT;
+ 		config->model_cfg |= model_cfg;
+@@ -1407,7 +1467,7 @@ static const struct regmap_config max77759_fg_regmap_cfg = {
+ };
+ 
+ static const struct power_supply_desc max17042_psy_desc = {
+-	.name		= "max170xx_battery",
++	.name		= "battery",
+ 	.type		= POWER_SUPPLY_TYPE_BATTERY,
+ 	.get_property	= max17042_get_property,
+ 	.set_property	= max17042_set_property,
+@@ -1419,7 +1479,7 @@ static const struct power_supply_desc max17042_psy_desc = {
+ };
+ 
+ static const struct power_supply_desc max17042_no_current_sense_psy_desc = {
+-	.name		= "max170xx_battery",
++	.name		= "battery",
+ 	.type		= POWER_SUPPLY_TYPE_BATTERY,
+ 	.get_property	= max17042_get_property,
+ 	.set_property	= max17042_set_property,
+@@ -1548,7 +1608,7 @@ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "failed to read status\n");
+ 
+-	if (val & STATUS_POR_BIT) {
++	if ((val & STATUS_POR_BIT) || max17055_config_changed(chip)) {
+ 		ret = devm_delayed_work_autocancel(dev, &chip->work,
+ 						   max17042_init_worker);
+ 		if (ret)

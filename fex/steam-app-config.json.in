@@ -1,0 +1,13 @@
+{
+  "Config": {
+    "TSOEnabled": "1",
+    "Multiblock": "1",
+    "HostEnv": "VK_INSTANCE_LAYERS=",
+    "ThunkHostLibs": "@FEX_THUNKS@/HostThunks",
+    "ThunkGuestLibs": "@FEX_THUNKS@/GuestThunks"
+  },
+  "ThunksDB": {
+    "Vulkan": "1",
+    "WaylandClient": "1"
+  }
+}

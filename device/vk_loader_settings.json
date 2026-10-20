@@ -1,0 +1,10 @@
+{
+  "file_format_version": "1.0.0",
+  "settings": {
+    "layers": [
+      { "name": "VK_LAYER_MANGOHUD_overlay_aarch64", "path": "/usr/share/vulkan/implicit_layer.d/MangoHud.aarch64.json", "control": "auto", "treat_as_implicit_manifest": true },
+      { "control": "unordered_layer_location" },
+      { "name": "VK_LAYER_window_system_integration", "path": "/usr/share/vulkan/implicit_layer.d/VkLayer_window_system_integration.json", "control": "auto", "treat_as_implicit_manifest": true }
+    ]
+  }
+}

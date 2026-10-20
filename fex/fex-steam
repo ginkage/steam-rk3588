@@ -1,0 +1,21 @@
+#!/bin/sh
+# Steam launch wrapper for x86 Linux games run through the FEX-Emu compatibility tool on Mali.
+# Use as the game's launch options:  ~/.local/share/fex-thunks/fex-steam %command%
+#
+# - FEX_APP_CONFIG_LOCATION: Config.json (RootFS) plus a ThunksDB.json whose overlays also cover
+#   pressure-vessel's /usr/lib/pressure-vessel/overrides library directory, which FEX misses inside
+#   the Steam Runtime container.
+# - FEX_APP_CONFIG: TSO, the Vulkan and Wayland thunks (patched Wayland pair, see rebuild.sh), and
+#   clearing the nonexistent Valve layers steam-launch-wrapper puts in VK_INSTANCE_LAYERS on the
+#   native side, where the thunked Vulkan loader reads it. The compat tool keeps this file instead of
+#   generating its own.
+# - __GLX_VENDOR_LIBRARY_NAME: glvnd in the container doesn't otherwise pick Mesa for x86 GLX, which
+#   Unity needs for its window visual (GL then runs as zink on the Mali through the Vulkan thunk).
+# - Steam's Fossilize layer crashes thunked Vulkan applications.
+
+here=$(dirname "$(readlink -f "$0")")
+export FEX_APP_CONFIG_LOCATION="$here/config/"
+export FEX_APP_CONFIG="$here/steam-app-config.json"
+export __GLX_VENDOR_LIBRARY_NAME=mesa
+export DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1
+exec "$@"
